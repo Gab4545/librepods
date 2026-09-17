@@ -33,6 +33,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---- EXPERIMENTAL: actually build the hi-res mic driver from source ---
+      # Upstream note (see header): the driver is normally NOT built here, its
+      # prebuilt .sys/.inf/.cat are committed as-is. That means a source change
+      # under windows/drivers/mic (e.g. a MicPipe.cpp fix) does nothing to the
+      # shipped build unless someone rebuilds it locally with the WDK and
+      # commits the new binary. This block does that rebuild on the runner
+      # instead, using Microsoft's documented WinGet-based WDK install
+      # (learn.microsoft.com/windows-hardware/drivers/install-the-wdk-using-winget),
+      # then regenerates the catalog and overwrites windows/drivers/mic/prebuilt/
+      # so the existing "Assemble install folder" step below picks up the fresh
+      # build automatically. Not exercised by upstream CI yet — if a step here
+      # fails, check the exact component/package IDs against the current WDK
+      # docs, they occasionally bump with new Windows SDK releases.
+      - name: Install Windows SDK + WDK (winget)
+        shell: pwsh
+        run: |
+          winget install --source winget --exact --id Microsoft.WindowsSDK.10.0.26100 `
+            --accept-package-agreements --accept-source-agreements --disable-interactivity
+          winget install --source winget --exact --id Microsoft.WindowsWDK.10.0.26100 `
+            --accept-package-agreements --accept-source-agreements --disable-interactivity
+
+      - name: Install WDK Visual Studio extension
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $engine  = & $vswhere -nologo -latest -products * -property enginePath
+          $vsixInstaller = Join-Path $engine 'VSIXInstaller.exe'
+          $vsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix" -Recurse -Filter WDK.vsix -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $vsix) {
+            Write-Host "WDK.vsix not found — assuming this VS version already bundles WDK toolset support."
+          } else {
+            # 1001/2001-ish codes from VSIXInstaller commonly mean "already installed"; don't fail the build on that.
+            $p = Start-Process -FilePath $vsixInstaller -ArgumentList "/quiet", "`"$($vsix.FullName)`"" -Wait -PassThru
+            Write-Host "VSIXInstaller exit code: $($p.ExitCode)"
+          }
+
+      - name: Build hi-res mic driver (KMDF, x64 Release)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild.exe not found via vswhere" }
+          & $msbuild windows/drivers/mic/AudioCodec/Driver/AudioCodec.sln /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE) { throw "Driver build failed (exit $LASTEXITCODE)" }
+
+      - name: Regenerate driver catalog + refresh the prebuilt package
+        shell: pwsh
+        run: |
+          $out = 'windows/drivers/mic/AudioCodec/Driver/x64/Release'
+          $sys = Join-Path $out 'AudioCodec.sys'
+          $inf = Join-Path $out 'AudioCodec.inf'
+          foreach ($f in @($sys, $inf)) { if (-not (Test-Path $f)) { throw "Missing $f after build" } }
+
+          $inf2cat = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter Inf2Cat.exe |
+            Where-Object { $_.FullName -match '\\x86\\' } | Select-Object -First 1
+          if (-not $inf2cat) { throw "Inf2Cat.exe not found under Windows Kits" }
+
+          $pkg = 'wdk-pkg'
+          Remove-Item $pkg -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item $sys, $inf $pkg -Force
+          & $inf2cat.FullName /driver:$pkg /os:10_X64
+          $cat = Join-Path $pkg 'audiocodec.cat'
+          if (-not (Test-Path $cat)) { throw "Inf2Cat did not produce audiocodec.cat" }
+
+          # Overwrite the committed prebuilt package so make-dist.ps1 (further
+          # below) bundles this freshly built driver instead of the old one.
+          Copy-Item (Join-Path $pkg 'AudioCodec.sys') 'windows/drivers/mic/prebuilt/AudioCodec.sys' -Force
+          Copy-Item (Join-Path $pkg 'AudioCodec.inf') 'windows/drivers/mic/prebuilt/AudioCodec.inf' -Force
+          Copy-Item $cat                              'windows/drivers/mic/prebuilt/audiocodec.cat' -Force
+          Write-Host "==> Freshly built LibrePodsMic driver copied into windows/drivers/mic/prebuilt/"
+
       # ---- Rust: daemon (native msvc target) ---------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
